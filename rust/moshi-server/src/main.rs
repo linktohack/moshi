@@ -68,18 +68,110 @@ struct Args {
     command: Command,
 }
 
+/// TTS Config that matches Python's tts.toml format.
+/// Model architecture is loaded from config.json in the HuggingFace repo.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct TtsConfig {
-    pub lm_model_file: String,
+    /// HuggingFace repository for model files (e.g., "kyutai/tts-1.6b-en_fr")
+    #[serde(default = "default_hf_repo")]
+    pub hf_repo: String,
+    /// Text tokenizer file (e.g., "hf://kyutai/tts-1.6b-en_fr/tokenizer_spm_8k_en_fr_audio.model")
     pub text_tokenizer_file: String,
-    pub speaker_tokenizer_file: String,
-    pub audio_tokenizer_file: String,
-    pub voices: std::collections::HashMap<String, String>,
-    pub voice_dir: String,
-    pub model: moshi::lm::Config,
-    pub generation: moshi::tts_streaming::Config,
+    /// Optional override for DSM/Moshi model weights
+    #[serde(default)]
+    pub moshi_weight: Option<String>,
+    /// Optional override for Mimi codec weights
+    #[serde(default)]
+    pub mimi_weight: Option<String>,
+    /// Optional override for config.json path
+    #[serde(default)]
+    pub config_path: Option<String>,
+    /// Batch size for TTS
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    /// Text BOS token
+    #[serde(default = "default_text_bos_token")]
+    pub text_bos_token: u32,
+    /// Voice folder containing .wav files and pre-computed .safetensors embeddings
+    pub voice_folder: String,
+    /// Default voice (relative to voice_folder)
+    pub default_voice: String,
+    /// CFG coefficient
+    #[serde(default = "default_cfg_coef")]
+    pub cfg_coef: f64,
+    /// Whether CFG applies to no-text condition
+    #[serde(default)]
+    pub cfg_is_no_text: bool,
+    /// Padding between words
+    #[serde(default = "default_padding_between")]
+    pub padding_between: usize,
+    /// Number of audio codebooks
+    #[serde(default = "default_n_q")]
+    pub n_q: usize,
+    /// Optional dtype override
     #[serde(default)]
     pub dtype_override: Option<String>,
+    /// Initial padding steps
+    #[serde(default = "default_initial_padding")]
+    pub initial_padding: usize,
+    /// Maximum padding steps
+    #[serde(default = "default_max_padding")]
+    pub max_padding: usize,
+    /// Final padding steps
+    #[serde(default = "default_final_padding")]
+    pub final_padding: usize,
+    /// Padding bonus
+    #[serde(default = "default_padding_bonus")]
+    pub padding_bonus: f64,
+    /// Temperature for sampling (used for both audio and text, like Python)
+    #[serde(default = "default_temp")]
+    pub temp: f64,
+    /// Top-k for sampling
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    /// Top-k for text token sampling
+    #[serde(default = "default_top_k_text")]
+    pub top_k_text: usize,
+}
+
+fn default_batch_size() -> usize {
+    2 // Python moshi-server/tts.py:63 (batch_size implied from usage)
+}
+fn default_text_bos_token() -> u32 {
+    1 // Python: SentencePiece BOS token ID
+}
+fn default_cfg_coef() -> f64 {
+    2.0 // Python moshi-server/tts.py:73 (cfg_coef: float = 2.)
+}
+fn default_padding_between() -> usize {
+    1 // Python moshi-server/tts.py:78 (padding_between: int = 1)
+}
+fn default_n_q() -> usize {
+    24 // Python moshi-server/tts.py:63 (n_q: int = 24)
+}
+fn default_initial_padding() -> usize {
+    2 // Python moshi/models/tts.py:390 (initial_padding: int = 2)
+}
+fn default_max_padding() -> usize {
+    8 // Python moshi/models/tts.py:391 (max_padding: int = 8)
+}
+fn default_final_padding() -> usize {
+    4 // Python moshi/models/tts.py:383 (final_padding: int = 4)
+}
+fn default_padding_bonus() -> f64 {
+    0.0 // Python moshi/models/tts.py:386 (padding_bonus: float = 0.)
+}
+fn default_hf_repo() -> String {
+    "kyutai/tts-1.6b-en_fr".to_string()
+}
+fn default_temp() -> f64 {
+    0.6 // Python moshi/models/tts.py:381 (temp: float = 0.6), used for both audio and text
+}
+fn default_top_k() -> usize {
+    250 // Python moshi/models/lm.py:557 (top_k: int = 250)
+}
+fn default_top_k_text() -> usize {
+    25 // Python moshi/models/lm.py:558 (top_k_text: int = 25)
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -218,14 +310,8 @@ impl Config {
                     c.audio_tokenizer_file = rod(&c.audio_tokenizer_file)?;
                 }
                 ModuleConfig::Tts { path: _, config: c } => {
-                    c.lm_model_file = rod(&c.lm_model_file)?;
                     c.text_tokenizer_file = rod(&c.text_tokenizer_file)?;
-                    c.speaker_tokenizer_file = rod(&c.speaker_tokenizer_file)?;
-                    c.audio_tokenizer_file = rod(&c.audio_tokenizer_file)?;
-                    for (_, v) in c.voices.iter_mut() {
-                        *v = rod(v)?
-                    }
-                    c.voice_dir = rod(&c.voice_dir)?;
+                    // voice_folder is resolved at runtime in tts::Model::new
                 }
                 ModuleConfig::BatchedAsr { path: _, config: c, batch_size: _ } => {
                     c.lm_model_file = rod(&c.lm_model_file)?;
@@ -360,24 +446,23 @@ impl Module {
                 Self::PyBatchedAsr { m, path: path.to_string() }
             }
             ModuleConfig::Tts { path, config } => {
-                let voice = config.voices.keys().next();
                 let m = tts::Model::new(config, full_cfg, dev)?;
                 let m = Arc::new(m);
-                if let Some(voice) = voice {
-                    tracing::info!(voice, "warming up the tts");
-                    m.run(&TtsQuery {
-                        text: vec!["hello".to_string()],
-                        seed: 42,
-                        temperature: 0.8,
-                        top_k: 250,
-                        voice: Some(voice.clone()),
-                        voices: None,
-                        max_seq_len: None,
-                        return_timestamps: None,
-                        cfg_alpha: None,
-                    })?;
-                    tracing::info!("done warming up the tts, ready to roll!");
-                }
+                // Warm up with default voice
+                let default_voice = config.default_voice.clone();
+                tracing::info!(voice = %default_voice, "warming up the tts");
+                m.run(&TtsQuery {
+                    text: vec!["hello".to_string()],
+                    seed: 42,
+                    temperature: 0.8,
+                    top_k: 250,
+                    voice: Some(default_voice),
+                    voices: None,
+                    max_seq_len: None,
+                    return_timestamps: None,
+                    cfg_alpha: None,
+                })?;
+                tracing::info!("done warming up the tts, ready to roll!");
                 Self::Tts { m, path: path.to_string() }
             }
             ModuleConfig::Mimi { send_path, recv_path, config } => {
@@ -596,10 +681,11 @@ fn default_seed() -> u64 {
     42
 }
 fn default_temperature() -> f64 {
-    0.8
+    0.6 // Python moshi/models/tts.py:381 (temp: float = 0.6)
 }
-fn default_top_k() -> usize {
-    250
+// Note: default_top_k defined above with TtsConfig defaults
+fn default_text_top_k() -> usize {
+    25 // Python moshi/models/lm.py:558 (top_k_text: int = 25)
 }
 fn default_format() -> StreamingOutput {
     StreamingOutput::OggOpus
@@ -613,6 +699,9 @@ struct TtsStreamingQuery {
     temperature: f64,
     #[serde(default = "default_top_k")]
     top_k: usize,
+    /// Top-k for text sampling (Python: lm.py:558 uses 25)
+    #[serde(default = "default_text_top_k")]
+    text_top_k: usize,
     #[serde(default = "default_format")]
     format: StreamingOutput,
     voice: Option<String>,
@@ -789,6 +878,9 @@ struct PyStreamingQuery {
     format: StreamingOutput,
     #[serde(default)]
     voice: Option<String>,
+    /// Seed for deterministic sampling (for Python/Rust parity testing)
+    #[serde(default = "default_seed")]
+    seed: u64,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]

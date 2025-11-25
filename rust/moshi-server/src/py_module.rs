@@ -107,6 +107,7 @@ struct Channel {
     out_tx: OutSend,
     encoder: crate::tts::Encoder,
     voice: Option<Voice>,
+    seed: u64,
     sent_init: bool,
     words: std::collections::VecDeque<String>,
     steps: usize,
@@ -119,6 +120,7 @@ impl Channel {
         out_tx: OutSend,
         encoder: crate::tts::Encoder,
         voice: Option<String>,
+        seed: u64,
     ) -> Self {
         metrics::OPEN_CHANNELS.inc();
         let words = std::collections::VecDeque::new();
@@ -129,6 +131,7 @@ impl Channel {
             encoder,
             words,
             voice: voice.map(Voice::File),
+            seed,
             sent_init: false,
             steps: 0,
             prev_word_steps: 0,
@@ -213,10 +216,10 @@ impl<'py> IntoPyObject<'py> for Voice {
 }
 
 // The arguments passed to the python step function, for now this is:
-// (batch_idx, tokens, voice)
+// (batch_idx, tokens, voice, seed)
 // tokens can include a -1 to indicate a new user, and a -2 to indicate
-// end of stream.
-type PyInput = (usize, Vec<i32>, Option<Voice>);
+// end of stream. seed is provided for deterministic sampling.
+type PyInput = (usize, Vec<i32>, Option<Voice>, Option<u64>);
 
 impl Inner {
     fn pre_process(&self, _step_idx: usize) -> Result<(Vec<PyInput>, Vec<Option<ChannelId>>)> {
@@ -234,21 +237,24 @@ impl Inner {
                         Ok(Msg::Text(word, tokens)) => {
                             c.words.push_back(word);
                             let mut t = Vec::with_capacity(tokens.len() + 1);
-                            if !c.sent_init {
+                            let seed = if !c.sent_init {
                                 t.push(-1);
                                 c.sent_init = true;
-                            }
+                                Some(c.seed)  // Pass seed on first message
+                            } else {
+                                None
+                            };
                             for &v in tokens.iter() {
                                 t.push(v as i32);
                             }
-                            in_data.push((batch_idx, t, c.voice.take()));
+                            in_data.push((batch_idx, t, c.voice.take(), seed));
                         }
                         Ok(Msg::Voice { embeddings, shape }) => {
                             c.voice = Some(Voice::Embeddings { embeddings, shape });
                         }
                         Ok(Msg::Eos) => {
                             if c.sent_init {
-                                in_data.push((batch_idx, vec![-2], None));
+                                in_data.push((batch_idx, vec![-2], None, None));
                             } else {
                                 *channel = None
                             }
@@ -444,6 +450,7 @@ impl M {
         &self,
         format: StreamingOutput,
         voice: Option<String>,
+        seed: u64,
     ) -> Result<Option<(usize, InSend, OutRecv)>> {
         let mut channels = self.channels.lock().unwrap();
         // Linear scan to find an available channel. This is fairly inefficient, instead we should
@@ -459,7 +466,7 @@ impl M {
                 if let Some(header) = encoder.header()? {
                     out_tx.send(header)?
                 }
-                let c = Channel::new(in_rx, out_tx, encoder, voice.clone());
+                let c = Channel::new(in_rx, out_tx, encoder, voice.clone(), seed);
                 *channel = Some(c);
                 return Ok(Some((batch_idx, in_tx, out_rx)));
             }
@@ -482,8 +489,10 @@ impl M {
         metrics::CONNECT.inc();
         let (batch_idx, in_tx, mut out_rx) = {
             let mut num_tries = 0;
+            // Use default seed for POST requests (no seed in TtsQuery)
+            let default_seed = 299792458u64;
             loop {
-                match self.channels(StreamingOutput::Pcm, Some(query.voice.clone())) {
+                match self.channels(StreamingOutput::Pcm, Some(query.voice.clone()), default_seed) {
                     Ok(Some(x)) => break x,
                     Ok(None) => {
                         num_tries += 1;
@@ -544,7 +553,7 @@ impl M {
         metrics::CONNECT.inc();
 
         let (mut sender, receiver) = socket.split();
-        let (bidx, in_tx, mut out_rx) = match self.channels(query.format, query.voice.clone())? {
+        let (bidx, in_tx, mut out_rx) = match self.channels(query.format, query.voice.clone(), query.seed)? {
             Some(x) => x,
             None => {
                 tracing::error!("no free channels");

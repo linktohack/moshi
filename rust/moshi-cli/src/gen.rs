@@ -57,8 +57,14 @@ pub fn run(args: &Args, dev: &Device) -> Result<()> {
         Some(cp) => {
             let conditions = if args.cfg_alpha.is_some() {
                 use moshi::conditioner::Condition::AddToInput;
-                let AddToInput(c1) = cp.condition_lut("description", "very_good")?;
-                let AddToInput(c2) = cp.condition_lut("description", "very_bad")?;
+                let c1 = match cp.condition_lut("description", "very_good")? {
+                    AddToInput(t) => t,
+                    _ => anyhow::bail!("expected AddToInput condition"),
+                };
+                let c2 = match cp.condition_lut("description", "very_bad")? {
+                    AddToInput(t) => t,
+                    _ => anyhow::bail!("expected AddToInput condition"),
+                };
                 AddToInput(Tensor::cat(&[c1, c2], 0)?)
             } else {
                 cp.condition_lut("description", "very_good")?

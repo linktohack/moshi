@@ -321,7 +321,7 @@ class TTSService:
             print(*args, **kwargs)
 
     @torch.no_grad()
-    def step(self, updates: list[tuple[int, list[int], np.ndarray | str | None]], pcm_out: np.ndarray,
+    def step(self, updates: list[tuple[int, list[int], np.ndarray | str | None, int | None]], pcm_out: np.ndarray,
              flags_out: np.ndarray, code_out: np.ndarray) -> None:
         mimi = self.tts_model.mimi
         machine = self.tts_model.machine
@@ -340,7 +340,7 @@ class TTSService:
         # List of new dynamic conditioning that we need to compute.
         new_voice_indexes: list[int] = []
         new_voice_sources: list[torch.Tensor] = []
-        for b, new_entry, voice in updates:
+        for b, new_entry, voice, seed in updates:
             client = self.clients[b]
             if not new_entry:
                 self._print(f"[{b}] NO TOKENS REALLY LAURENT.")
@@ -348,6 +348,10 @@ class TTSService:
                 client.reset(machine)
                 reset_mask[b] = True
                 new_entry = new_entry[1:]
+                # Set random seed for deterministic sampling if provided
+                if seed is not None:
+                    torch.manual_seed(seed)
+
                 if multi_speaker:
                     if isinstance(voice, np.ndarray):
                         new_voice_indexes.append(b)

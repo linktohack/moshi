@@ -2603,6 +2603,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "rayon",
+ "regex",
  "serde",
  "tracing",
 ]
@@ -2732,6 +2733,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "vergen",
+ "walkdir",
 ]
 
 [[package]]

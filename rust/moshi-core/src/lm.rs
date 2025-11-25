@@ -892,6 +892,9 @@ impl LmModel {
         if let Some(conditions) = conditions {
             match conditions {
                 crate::conditioner::Condition::AddToInput(v) => emb = emb.broadcast_add(v)?,
+                crate::conditioner::Condition::CrossAttention(_) => {
+                    // CrossAttention conditions are handled separately via ca_src
+                }
             }
         }
         let ys = self.transformer.forward(&emb, mask)?;
@@ -958,6 +961,9 @@ impl LmModel {
         if let Some(conditions) = conditions {
             match conditions {
                 crate::conditioner::Condition::AddToInput(v) => emb = emb.broadcast_add(v)?,
+                crate::conditioner::Condition::CrossAttention(_) => {
+                    // CrossAttention conditions are handled separately via ca_src
+                }
             }
         }
         let ys = self.transformer.forward_ca(&emb, Some(ca_src), mask)?;

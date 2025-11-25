@@ -16,6 +16,7 @@ candle-transformers = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 
 rayon = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 
