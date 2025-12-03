@@ -18,6 +18,55 @@ use moshi::tts_state_machine::{Entry, State, StateMachine, TokenIds};
 use candle::Module;
 use candle_nn::VarBuilder;
 
+// ===== Sinusoidal Positional Embeddings for Cross-Attention =====
+// Python fuser adds positional embeddings to cross-attention source.
+// This matches Python's create_sin_embedding + ConditionFuser.get_cross()
+
+/// Create sinusoidal positional embedding with shape [B, T, dim].
+/// Matches Python's create_sin_embedding from transformer.py
+fn create_sin_embedding(
+    seq_len: usize,
+    dim: usize,
+    device: &Device,
+    dtype: DType,
+    max_period: f32,
+) -> Result<Tensor> {
+    assert!(dim % 2 == 0, "dim must be even for sinusoidal embeddings");
+    let half_dim = dim / 2;
+
+    // positions: [0, 1, 2, ..., seq_len-1] with shape [1, seq_len, 1]
+    let positions: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
+    let positions = Tensor::from_vec(positions, (1, seq_len, 1), device)?;
+
+    // adim: frequency scales for each dimension
+    // Python: phase = positions / (max_period ** (adim / (half_dim - 1)))
+    let adim: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / max_period.powf(i as f32 / (half_dim - 1) as f32))
+        .collect();
+    let adim = Tensor::from_vec(adim, (1, 1, half_dim), device)?;
+
+    // Compute phase = positions * (1 / max_period^(adim / (half_dim-1)))
+    let phase = positions.broadcast_mul(&adim)?;
+
+    // Concatenate [cos(phase), sin(phase)] along last dimension
+    let pos_emb = Tensor::cat(&[phase.cos()?, phase.sin()?], candle::D::Minus1)?;
+    Ok(pos_emb.to_dtype(dtype)?)
+}
+
+/// Add sinusoidal positional embeddings to cross-attention source.
+/// Matches Python ConditionFuser.get_cross() when cross_attention_pos_emb=True.
+fn add_cross_attention_pos_emb(
+    cross_src: &Tensor,
+    scale: f32,
+    max_period: f32,
+) -> Result<Tensor> {
+    let (_b, seq_len, dim) = cross_src.dims3()?;
+    let pos_emb = create_sin_embedding(seq_len, dim, cross_src.device(), cross_src.dtype(), max_period)?;
+    // cross = cross + scale * pos_emb
+    let scaled_pos_emb = (pos_emb * scale as f64)?;
+    Ok(cross_src.broadcast_add(&scaled_pos_emb)?)
+}
+
 // ===== TTS-Specific DepFormer Implementation =====
 // The TTS model uses a shared transformer with per-slice gating,
 // which differs from the standard moshi-core DepFormer that has
@@ -1205,8 +1254,13 @@ impl Model {
             for (voice_name, voice_emb) in &voices {
                 match condition_provider.condition_tensor("speaker_wavs", &voice_emb.tensor, &voice_emb.mask) {
                     Ok(moshi::conditioner::Condition::CrossAttention(cross_src)) => {
-                        cross_attention_cache.insert(voice_name.clone(), cross_src);
-                        tracing::debug!(voice = %voice_name, "Computed cross-attention source");
+                        // Add sinusoidal positional embeddings to cross-attention source
+                        // Python ConditionFuser.get_cross() does this when cross_attention_pos_emb=True
+                        // Config: cross_attention_pos_emb=true, cross_attention_pos_emb_scale=1, max_period=10000
+                        let cross_src_with_pos = add_cross_attention_pos_emb(&cross_src, 1.0, 10000.0)
+                            .context("Failed to add positional embeddings to cross-attention source")?;
+                        cross_attention_cache.insert(voice_name.clone(), cross_src_with_pos);
+                        tracing::debug!(voice = %voice_name, "Computed cross-attention source with positional embeddings");
                     }
                     Ok(_) => tracing::warn!(voice = %voice_name, "speaker_wavs condition is not CrossAttention type"),
                     Err(e) => tracing::warn!(voice = %voice_name, error = ?e, "Failed to compute cross-attention source"),
