@@ -17,6 +17,7 @@ mod batched_asr;
 mod lm;
 mod metrics;
 mod mimi;
+mod mlx_module;
 mod protocol;
 mod py_basr_module;
 mod py_module;
@@ -29,6 +30,7 @@ const ID_HEADER: &str = "kyutai-api-key";
 const ROOM_ID_HEADER: &str = "room_id";
 
 pub const TTS_PY: &[u8] = include_bytes!("../tts.py");
+pub const TTS_MLX_PY: &[u8] = include_bytes!("../tts_mlx.py");
 pub const ASR_PY: &[u8] = include_bytes!("../batched_asr.py");
 pub const VOICE_PY: &[u8] = include_bytes!("../voice.py");
 pub const UV_LOCK: &[u8] = include_bytes!("../uv.lock");
@@ -150,6 +152,40 @@ pub struct PyPostConfig {
     pub py: Option<toml::Table>,
 }
 
+/// MLX TTS Config - uses moshi_mlx Python package for Apple Silicon acceleration
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MlxConfig {
+    /// Text tokenizer file (SentencePiece model)
+    pub text_tokenizer_file: String,
+    /// Batch size for TTS
+    #[serde(default = "default_mlx_batch_size")]
+    pub batch_size: usize,
+    /// Text BOS token
+    #[serde(default = "default_text_bos_token")]
+    pub text_bos_token: u32,
+    /// Voice folder containing .wav files and pre-computed embeddings
+    pub voice_folder: String,
+    /// Default voice (relative to voice_folder)
+    pub default_voice: String,
+    /// Optional custom Python script path
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Quantization bits (4 or 8), None for no quantization
+    #[serde(default)]
+    pub quantize: Option<u8>,
+    /// Additional Python config options passed to init()
+    #[serde(default)]
+    pub py: Option<toml::Table>,
+}
+
+fn default_mlx_batch_size() -> usize {
+    1 // MLX typically runs with batch_size=1 for streaming
+}
+
+fn default_text_bos_token() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum ModuleConfig {
@@ -194,6 +230,11 @@ pub enum ModuleConfig {
         path: String,
         #[serde(flatten)]
         config: PyPostConfig,
+    },
+    Mlx {
+        path: String,
+        #[serde(flatten)]
+        config: MlxConfig,
     },
 }
 
@@ -268,6 +309,16 @@ impl Config {
                         crate::utils::resolve_or_download_toml(t)?;
                     }
                 }
+                ModuleConfig::Mlx { path: _, config: c } => {
+                    if let Some(script) = &mut c.script {
+                        *script = rod(script)?;
+                    }
+                    c.text_tokenizer_file = rod(&c.text_tokenizer_file)?;
+                    // voice_folder is resolved at runtime in mlx_module
+                    if let Some(t) = c.py.as_mut() {
+                        crate::utils::resolve_or_download_toml(t)?;
+                    }
+                }
             }
         }
         config.static_dir = rod(&config.static_dir)?;
@@ -299,6 +350,7 @@ enum Module {
     Lm { path: String, m: Arc<lm::Lm> },
     Py { path: String, m: Arc<py_module::M> },
     PyPost { path: String, m: Arc<py_module_post::M> },
+    Mlx { path: String, m: Arc<mlx_module::M> },
 }
 
 struct SharedStateInner {
@@ -395,6 +447,11 @@ impl Module {
                 let m = Arc::new(m);
                 Self::PyPost { m, path: path.to_string() }
             }
+            ModuleConfig::Mlx { path, config } => {
+                let m = mlx_module::M::new(config.clone())?;
+                let m = Arc::new(m);
+                Self::Mlx { m, path: path.to_string() }
+            }
         };
         Ok(m)
     }
@@ -411,6 +468,7 @@ impl Module {
             }
             Self::Py { path, m } => py_router(m.clone(), path, shared_state),
             Self::PyPost { path, m } => py_router_post(m.clone(), path, shared_state),
+            Self::Mlx { path, m } => mlx_router(m.clone(), path, shared_state),
         };
         Ok(router)
     }
@@ -985,6 +1043,69 @@ fn py_router(s: Arc<py_module::M>, path: &str, ss: &SharedState) -> axum::Router
         let py_query = req.0.clone();
         let py = state.0 .0.clone();
         let upg = ws.write_buffer_size(0).on_upgrade(move |v| py_websocket(v, py, py_query, addr));
+        Ok(upg)
+    }
+    axum::Router::new()
+        .route(path, axum::routing::post(t))
+        .route(path, axum::routing::get(streaming_t))
+        .with_state((s, ss.clone()))
+}
+
+fn mlx_router(s: Arc<mlx_module::M>, path: &str, ss: &SharedState) -> axum::Router<()> {
+    async fn mlx_websocket(
+        socket: axum::extract::ws::WebSocket,
+        state: Arc<mlx_module::M>,
+        query: PyStreamingQuery,
+        _addr: Option<String>,
+    ) {
+        if let Err(err) = state.handle_socket(socket, query).await {
+            tracing::error!(?err, "mlx")
+        }
+    }
+
+    async fn t(
+        state: axum::extract::State<(Arc<mlx_module::M>, SharedState)>,
+        headers: axum::http::HeaderMap,
+        req: axum::Json<mlx_module::TtsQuery>,
+    ) -> utils::AxumResult<Response> {
+        tracing::info!("handling mlx tts post query {req:?}");
+        let valid_id = headers
+            .get(ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|id| state.0 .1.config.authorized_ids.contains(id));
+        if !valid_id {
+            return Ok(StatusCode::UNAUTHORIZED.into_response());
+        }
+        let wav_stream = state.0 .0.handle_query(&req).await?;
+        let body = Body::from_stream(wav_stream);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "audio/wav")
+            .body(body)
+            .unwrap();
+
+        Ok(response)
+    }
+
+    async fn streaming_t(
+        ws: axum::extract::ws::WebSocketUpgrade,
+        headers: axum::http::HeaderMap,
+        state: axum::extract::State<(Arc<mlx_module::M>, SharedState)>,
+        req: axum::extract::Query<PyStreamingQuery>,
+    ) -> utils::AxumResult<Response> {
+        let addr = headers.get("X-Real-IP").and_then(|v| v.to_str().ok().map(|v| v.to_string()));
+        tracing::info!(addr, "handling mlx streaming query");
+        let auth_id = match headers.get(ID_HEADER) {
+            Some(v) => v.to_str().ok(),
+            None => req.auth_id.as_deref(),
+        };
+        let valid_id = auth_id.is_some_and(|id| state.1.config.authorized_ids.contains(id));
+        if !valid_id {
+            return Ok(StatusCode::UNAUTHORIZED.into_response());
+        }
+        let mlx_query = req.0.clone();
+        let mlx = state.0 .0.clone();
+        let upg = ws.write_buffer_size(0).on_upgrade(move |v| mlx_websocket(v, mlx, mlx_query, addr));
         Ok(upg)
     }
     axum::Router::new()
