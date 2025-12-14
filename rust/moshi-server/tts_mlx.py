@@ -39,10 +39,6 @@ class MaskFlags(Enum):
     MISSING_WORDS = 16
 
 
-def flags_out_from_mask_(flags_out: np.ndarray, mask: np.ndarray, value: int):
-    flags_out[mask] |= value
-
-
 @dataclass
 class Config:
     hf_repo: str = DEFAULT_DSM_TTS_REPO
@@ -125,34 +121,46 @@ def init(batch_size: int, config_override: dict) -> 'TTSService':
         cfg_coef_conditioning = tts_model.cfg_coef
         tts_model.cfg_coef = 1.0
 
-    # Load voices
+    # Load voices - only look for .safetensors files directly
     print(f"[MLX] Loading voices from {config.voice_folder}", file=sys.stderr, flush=True)
     voice_suffix = tts_model.voice_suffix
     all_attributes = {}
     voice_folder = Path(config.voice_folder)
 
     if tts_model.multi_speaker:
+        # Only look for files that end with the voice suffix (e.g., .1e68beda@240.safetensors)
         for file in voice_folder.glob(f'**/*{voice_suffix}'):
             relative = file.relative_to(voice_folder)
             name = str(relative.with_name(relative.name.removesuffix(voice_suffix)))
             name_normalized = name.replace('\\', '/')
             try:
                 attributes = tts_model.make_condition_attributes([file, file], cfg_coef=cfg_coef_conditioning)
-            except Exception as e:
-                print(f"[MLX WARNING] Failed to load voice {name_normalized}: {e}", file=sys.stderr)
-            else:
                 all_attributes[name] = attributes
                 if name != name_normalized:
                     all_attributes[name_normalized] = attributes
+            except Exception as e:
+                # Only warn for files that should work (actual safetensors files)
+                print(f"[MLX WARNING] Failed to load voice {name_normalized}: {e}", file=sys.stderr)
 
         if not all_attributes:
             raise RuntimeError(
                 f"No voices found in {voice_folder}/**/*{voice_suffix}"
             )
 
+        print(f"[MLX] Loaded {len(all_attributes)} voices", file=sys.stderr, flush=True)
+
         if config.default_voice not in all_attributes:
-            print(f"[MLX WARNING] Default voice {config.default_voice} not found, using first available", file=sys.stderr)
-            config.default_voice = list(all_attributes.keys())[0]
+            # Try adding .wav suffix
+            default_with_wav = config.default_voice + ".wav" if not config.default_voice.endswith(".wav") else config.default_voice
+            default_without_wav = config.default_voice.removesuffix(".wav")
+            if default_with_wav in all_attributes:
+                config.default_voice = default_with_wav
+            elif default_without_wav in all_attributes:
+                config.default_voice = default_without_wav
+            else:
+                print(f"[MLX WARNING] Default voice {config.default_voice} not found, using first available", file=sys.stderr)
+                config.default_voice = list(all_attributes.keys())[0]
+        print(f"[MLX] Using default voice: {config.default_voice}", file=sys.stderr, flush=True)
 
     service = TTSService(
         batch_size=batch_size,
@@ -172,123 +180,17 @@ def _make_null(all_attributes: tp.Sequence[ConditionAttributes]) -> list[Conditi
 
 
 @dataclass
-class TTSGen:
-    """MLX TTS generator - handles streaming generation for a single client."""
-    tts_model: TTSModel
-    attributes: tp.Sequence[ConditionAttributes]
-    on_frame: tp.Optional[tp.Callable[[mx.array], None]] = None
-
-    def __post_init__(self):
-        tts_model = self.tts_model
-        attributes = self.attributes
-
-        self.offset = 0
-        self.state = self.tts_model.machine.new_state([])
-
-        if tts_model.cfg_coef != 1.0:
-            if tts_model.valid_cfg_conditionings:
-                raise ValueError(
-                    "This model does not support direct CFG, but was trained with "
-                    "CFG distillation. Pass instead `cfg_coef` to `make_condition_attributes`."
-                )
-            nulled = _make_null(attributes)
-            attributes = list(attributes) + nulled
-
-        assert tts_model.lm.condition_provider is not None
-        self.ct = None
-        self.cross_attention_src = None
-        for _attr in attributes:
-            for _key, _value in _attr.text.items():
-                _ct = tts_model.lm.condition_provider.condition_tensor(_key, _value)
-                if self.ct is None:
-                    self.ct = _ct
-                else:
-                    self.ct = ConditionTensor(self.ct.tensor + _ct.tensor)
-            for _key, _value in _attr.tensor.items():
-                _conditioner = tts_model.lm.condition_provider.conditioners[_key]
-                _ca_src = _conditioner.condition(_value)
-                if self.cross_attention_src is None:
-                    self.cross_attention_src = _ca_src
-                else:
-                    raise ValueError("multiple cross-attention conditioners")
-
-        def _on_audio_hook(audio_tokens):
-            delays = tts_model.lm.delays
-            for q in range(audio_tokens.shape[0]):
-                delay = delays[q]
-                if self.offset < delay + tts_model.delay_steps:
-                    audio_tokens[q] = tts_model.machine.token_ids.zero
-
-        def _on_text_hook(text_tokens):
-            tokens = text_tokens.tolist()
-            out_tokens = []
-            for token in tokens:
-                out_token, _ = tts_model.machine.process(self.offset, self.state, token)
-                out_tokens.append(out_token)
-            text_tokens[:] = mx.array(out_tokens, dtype=mx.int64)
-
-        self.lm_gen = LmGen(
-            tts_model.lm,
-            max_steps=tts_model.max_gen_length,
-            text_sampler=Sampler(temp=tts_model.temp),
-            audio_sampler=Sampler(temp=tts_model.temp),
-            cfg_coef=tts_model.cfg_coef,
-            on_text_hook=_on_text_hook,
-            on_audio_hook=_on_audio_hook,
-        )
-
-    def process_last(self):
-        while len(self.state.entries) > 0 or self.state.end_step is not None:
-            self._step()
-        additional_steps = (
-            self.tts_model.delay_steps + max(self.tts_model.lm.delays) + 8
-        )
-        for _ in range(additional_steps):
-            self._step()
-
-    def process(self):
-        while len(self.state.entries) > self.tts_model.machine.second_stream_ahead:
-            self._step()
-
-    def _step(self):
-        missing = self.tts_model.lm.n_q - self.tts_model.lm.dep_q
-        input_tokens = (
-            mx.ones((1, missing), dtype=mx.int64)
-            * self.tts_model.machine.token_ids.zero
-        )
-        self.lm_gen.step(
-            input_tokens, ct=self.ct, cross_attention_src=self.cross_attention_src
-        )
-        frame = self.lm_gen.last_audio_tokens()
-        self.offset += 1
-        if frame is not None:
-            if self.on_frame is not None:
-                self.on_frame(frame)
-
-    def append_entry(self, entry):
-        self.state.entries.append(entry)
-
-
-@dataclass
 class ClientState:
+    """State for a single TTS client."""
     is_complete: bool = False
-    gen: TTSGen | None = None
+    offset: int = 0
+    state: tp.Any = None  # State machine state
+    lm_gen: tp.Any = None
+    ct: tp.Any = None
+    cross_attention_src: tp.Any = None
     pcm_queue: list = field(default_factory=list)
-    word_finished: bool = False
-
-    def reset(self, tts_model: TTSModel, attributes: tp.Sequence[ConditionAttributes]):
-        self.is_complete = False
-        self.pcm_queue = []
-        self.word_finished = False
-
-        def on_frame(frame):
-            if (frame == -1).any():
-                return
-            pcm = tts_model.mimi.decode_step(frame[:, :, None])
-            pcm = np.array(mx.clip(pcm[0, 0], -1, 1))
-            self.pcm_queue.append(pcm)
-
-        self.gen = TTSGen(tts_model, attributes, on_frame=on_frame)
+    word_consumed_this_step: bool = False
+    tts_model: tp.Any = None
 
 
 @dataclass
@@ -310,12 +212,164 @@ class TTSService:
         print("[MLX] Warming up...", file=sys.stderr, flush=True)
         mx.eval(self.tts_model.mimi.parameters())
         mx.eval(self.tts_model.lm.parameters())
+        print(f"[MLX] second_stream_ahead={self.tts_model.machine.second_stream_ahead}", file=sys.stderr, flush=True)
+        print(f"[MLX] delay_steps={self.tts_model.delay_steps}", file=sys.stderr, flush=True)
         print("[MLX] Warmup complete", file=sys.stderr, flush=True)
 
     def _get_attributes(self, voice: str | None) -> tp.Sequence[ConditionAttributes]:
-        if voice and voice in self.all_attributes:
-            return self.all_attributes[voice]
+        if voice:
+            # Try exact match
+            if voice in self.all_attributes:
+                return self.all_attributes[voice]
+            # Try with/without .wav suffix
+            voice_with_wav = voice if voice.endswith(".wav") else voice + ".wav"
+            voice_without_wav = voice.removesuffix(".wav")
+            if voice_with_wav in self.all_attributes:
+                return self.all_attributes[voice_with_wav]
+            if voice_without_wav in self.all_attributes:
+                return self.all_attributes[voice_without_wav]
         return self.all_attributes[self.default_attribute_name]
+
+    def _reset_client(self, client: ClientState, voice: str | None, seed: int | None):
+        """Reset a client for new generation."""
+        if seed is not None:
+            mx.random.seed(seed)
+
+        client.is_complete = False
+        client.offset = 0
+        client.pcm_queue = []
+        client.word_consumed_this_step = False
+        client.tts_model = self.tts_model
+        client.state = self.tts_model.machine.new_state([])
+
+        attributes = [self._get_attributes(voice)]
+
+        if self.tts_model.cfg_coef != 1.0:
+            if self.tts_model.valid_cfg_conditionings:
+                raise ValueError("Model trained with CFG distillation")
+            nulled = _make_null(attributes)
+            attributes = attributes + nulled
+
+        assert self.tts_model.lm.condition_provider is not None
+        client.ct = None
+        client.cross_attention_src = None
+        for _attr in attributes:
+            for _key, _value in _attr.text.items():
+                _ct = self.tts_model.lm.condition_provider.condition_tensor(_key, _value)
+                if client.ct is None:
+                    client.ct = _ct
+                else:
+                    client.ct = ConditionTensor(client.ct.tensor + _ct.tensor)
+            for _key, _value in _attr.tensor.items():
+                _conditioner = self.tts_model.lm.condition_provider.conditioners[_key]
+                _ca_src = _conditioner.condition(_value)
+                if client.cross_attention_src is None:
+                    client.cross_attention_src = _ca_src
+                else:
+                    raise ValueError("multiple cross-attention conditioners")
+
+        # Create text hook that tracks word consumption
+        def _on_text_hook(text_tokens):
+            tokens = text_tokens.tolist()
+            out_tokens = []
+            for token in tokens:
+                # Handle both scalar and list tokens (MLX may return nested structure)
+                while isinstance(token, list):
+                    token = token[0] if token else 0
+
+                out_token, consumed_new_word = self.tts_model.machine.process(client.offset, client.state, token)
+                if consumed_new_word:
+                    client.word_consumed_this_step = True
+                out_tokens.append(out_token)
+            text_tokens[:] = mx.array(out_tokens, dtype=mx.int64)
+
+        def _on_audio_hook(audio_tokens):
+            delays = self.tts_model.lm.delays
+            for q in range(audio_tokens.shape[0]):
+                delay = delays[q]
+                if client.offset < delay + self.tts_model.delay_steps:
+                    audio_tokens[q] = self.tts_model.machine.token_ids.zero
+
+        client.lm_gen = LmGen(
+            self.tts_model.lm,
+            max_steps=self.tts_model.max_gen_length,
+            text_sampler=Sampler(temp=self.tts_model.temp),
+            audio_sampler=Sampler(temp=self.tts_model.temp),
+            cfg_coef=self.tts_model.cfg_coef,
+            on_text_hook=_on_text_hook,
+            on_audio_hook=_on_audio_hook,
+        )
+
+    def _client_step(self, client: ClientState) -> tp.Optional[np.ndarray]:
+        """Run a single step for a client. Returns PCM if available."""
+        if client.lm_gen is None:
+            return None
+
+        client.word_consumed_this_step = False
+
+        missing = self.tts_model.lm.n_q - self.tts_model.lm.dep_q
+        input_tokens = (
+            mx.ones((1, missing), dtype=mx.int64)
+            * self.tts_model.machine.token_ids.zero
+        )
+        client.lm_gen.step(
+            input_tokens, ct=client.ct, cross_attention_src=client.cross_attention_src
+        )
+        frame = client.lm_gen.last_audio_tokens()
+        client.offset += 1
+
+        # Debug: log state machine status periodically
+        if client.offset % 20 == 0:
+            entries_len = len(client.state.entries) if client.state else 0
+            end_step = client.state.end_step if client.state else None
+            print(f"[MLX DEBUG] offset={client.offset} entries={entries_len} end_step={end_step} complete={client.is_complete}", file=sys.stderr, flush=True)
+
+        if frame is not None and not (frame == -1).any():
+            pcm = self.tts_model.mimi.decode_step(frame[:, :, None])
+            pcm = np.array(mx.clip(pcm[0, 0], -1, 1))
+            return pcm
+        return None
+
+    def _is_client_active(self, client: ClientState) -> bool:
+        """Check if client can run (has enough lookahead)."""
+        if client.state is None or client.lm_gen is None:
+            return False
+        if client.is_complete:
+            return True
+        if not client.state.entries:
+            return False
+
+        lookahead = self.tts_model.machine.second_stream_ahead
+        if lookahead == 0:
+            return True
+        if not client.state.entries[0].tokens:
+            # Next entry is just padding
+            return True
+
+        remaining = lookahead + 1
+        for entry in client.state.entries:
+            if entry.tokens:
+                remaining -= 1
+            if remaining <= 0:
+                return True
+        return False
+
+    def _is_client_done(self, client: ClientState) -> bool:
+        """Check if client generation is complete."""
+        if not client.is_complete:
+            return False
+        if client.state is None:
+            return True
+        if len(client.state.entries) > 0 or client.state.end_step is None:
+            return False
+        real_end = (
+            client.state.end_step + self.tts_model.delay_steps +
+            self.tts_model.final_padding + max(self.tts_model.lm.delays)
+        )
+        # Debug first time we check done condition
+        if client.offset == client.state.end_step + 1:
+            print(f"[MLX DEBUG] end_step={client.state.end_step} delay_steps={self.tts_model.delay_steps} final_padding={self.tts_model.final_padding} max_delays={max(self.tts_model.lm.delays)} real_end={real_end}", file=sys.stderr, flush=True)
+        return client.offset >= real_end
 
     def step(self, updates: list[tuple[int, list[int], str | None, int | None]],
              pcm_out: np.ndarray, flags_out: np.ndarray, code_out: np.ndarray) -> None:
@@ -336,87 +390,55 @@ class TTSService:
         for b, new_entry, voice, seed in updates:
             client = self.clients[b]
 
-            if new_entry[0] == -1:
+            if new_entry and new_entry[0] == -1:
                 # Reset - new client
-                if seed is not None:
-                    mx.random.seed(seed)
-                attributes = self._get_attributes(voice)
-                client.reset(self.tts_model, [attributes])
+                self._reset_client(client, voice, seed)
                 new_entry = new_entry[1:]
 
-            if client.gen is None:
+            if client.state is None:
                 continue
 
             if new_entry == [-2]:
                 # End of stream
                 client.is_complete = True
-            elif new_entry[0] == pad:
+            elif new_entry and new_entry[0] == pad:
                 # Padding entry
                 padding = len(new_entry)
-                client.gen.append_entry(Entry([], '', padding=padding))
+                client.state.entries.append(Entry([], '', padding=padding))
             elif new_entry:
                 # Text tokens
                 padding = 0
                 if self.padding_between > 0:
                     padding = max(0, self.padding_between + len(new_entry) - 1)
-                client.gen.append_entry(Entry(new_entry, '', padding=padding))
+                client.state.entries.append(Entry(new_entry, '', padding=padding))
 
         # Process each client
         for b, client in enumerate(self.clients):
-            if client.gen is None:
+            if client.state is None:
                 continue
 
-            gen = client.gen
-            state = gen.state
-            lookahead = self.tts_model.machine.second_stream_ahead
+            # Check if done
+            if self._is_client_done(client):
+                flags_out[b] |= MaskFlags.IS_EOS.value
+                client.state = None
+                client.lm_gen = None
+                continue
 
             # Check if we can run
-            can_run = False
-            if client.is_complete:
-                can_run = True
-            elif state.entries:
-                if lookahead == 0:
-                    can_run = True
-                elif not state.entries[0].tokens:
-                    can_run = True
-                else:
-                    remaining = lookahead + 1
-                    for entry in state.entries:
-                        if entry.tokens:
-                            remaining -= 1
-                        if remaining <= 0:
-                            can_run = True
-                            break
-
-            if not can_run:
+            if not self._is_client_active(client):
                 flags_out[b] |= MaskFlags.MISSING_WORDS.value
                 continue
 
             flags_out[b] |= MaskFlags.AR_STEP.value
 
             # Run one step
-            if client.is_complete and (len(state.entries) == 0 and state.end_step is not None):
-                # Check if we're done
-                real_end = (
-                    state.end_step + self.tts_model.delay_steps +
-                    self.tts_model.final_padding + max(self.tts_model.lm.delays)
-                )
-                if gen.offset >= real_end:
-                    flags_out[b] |= MaskFlags.IS_EOS.value
-                    client.gen = None
-                    continue
+            pcm = self._client_step(client)
 
-            # Step the generator
-            if client.is_complete:
-                if len(state.entries) > 0 or state.end_step is not None:
-                    gen._step()
-                else:
-                    gen._step()  # Continue for delay
-            else:
-                gen.process()
+            # Check for word consumed
+            if client.word_consumed_this_step:
+                flags_out[b] |= MaskFlags.WORD_FINISHED.value
 
             # Check for PCM output
-            if client.pcm_queue:
-                pcm = client.pcm_queue.pop(0)
+            if pcm is not None:
                 pcm_out[b, :len(pcm)] = pcm
                 flags_out[b] |= MaskFlags.HAS_PCM.value
