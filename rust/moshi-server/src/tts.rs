@@ -916,8 +916,10 @@ impl Default for TtsModelConfig {
 /// Streaming generation state
 #[allow(dead_code)]
 pub struct GenState {
-    /// Cache for tokens with delay handling [batch, num_codebooks, cache_size]
-    pub cache: Tensor,
+    /// Cache for tokens with delay handling [num_codebooks][cache_size] — kept on CPU
+    pub cache: Vec<Vec<i64>>,
+    /// Cache size (max_delay + 2)
+    pub cache_size: usize,
     /// Initial token tensor
     pub initial: Tensor,
     /// Current offset
@@ -950,13 +952,9 @@ impl GenState {
         let max_delay = delays.iter().copied().max().unwrap_or(0);
         let cache_size = max_delay + 2;
 
-        // Initialize cache with ungenerated token ID (-2)
+        // Initialize cache with ungenerated token ID (-2) — CPU Vec for zero-cost reads/writes
         let ungenerated: i64 = -2;
-        let cache = Tensor::full(
-            ungenerated,
-            (1, num_codebooks, cache_size),
-            device,
-        )?.to_dtype(DType::I64)?;
+        let cache = vec![vec![ungenerated; cache_size]; num_codebooks];
 
         // Initial token tensor (zeros for padding)
         let initial = Tensor::zeros((1, num_codebooks, 1), DType::I64, device)?;
@@ -988,6 +986,7 @@ impl GenState {
 
         Ok(Self {
             cache,
+            cache_size,
             initial,
             offset: 0,
             delays_cuda,
@@ -1584,6 +1583,10 @@ impl Model {
         let max_gen_length = query.max_seq_len.unwrap_or(30000);
         let mut all_pcm = Vec::new();
         let mut timestamps = Vec::new();
+
+        // Create StreamMask once outside the loop (batch size 1, all active)
+        let mask = moshi::StreamMask::new(vec![true], &self.device)?;
+
         // Generation starts at offset 0, matching Python's client.offset = 0
         for offset in 0..max_gen_length {
             // Check if we're done - Python: real_end = end_step + delay_steps + final_padding + max_delay
@@ -1596,27 +1599,23 @@ impl Model {
             }
 
             // Run one step of generation
-            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref())?;
+            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref(), &mask)?;
 
-            if let Some(frame) = frame {
+            if let Some(ref frame_vec) = frame {
 
                 // Decode audio if past delay
                 let real_offset = offset as i64 - gen_state.max_delay as i64;
                 if real_offset >= self.config.delay_steps as i64 {
                     // Only take first n_q audio layers for Mimi (not all dep_q slices)
                     let n_q = self.config.n_q;
-                    let audio_frame = frame.i((0..1, 1..(1 + n_q), 0..1))?;
 
-                    // Handle negative token values to match Python's behavior:
-                    // Python's F.embedding wraps negative indices, so -1 maps to the last embedding (card-1).
-                    // We replicate this by converting -1 -> card-1 (2047) before decoding.
-                    // This is important for per-codebook delay masking where zero_token=-1.
+                    // frame_vec is [text, audio0, audio1, ...] — take audio codebooks 0..n_q
+                    // Clamp to [0, card-1] range, matching Python's clamp_(min=0)
                     let card = self.token_ids.card as i64;
-                    let audio_frame_vec: Vec<i64> = audio_frame.flatten_all()?.to_vec1()?;
-                    let audio_frame_wrapped: Vec<i64> = audio_frame_vec.iter().map(|&t| {
-                        // Clamp to [0, card-1] range, matching Python's clamp_(min=0)
-                        t.clamp(0, card - 1)
-                    }).collect();
+                    let audio_frame_wrapped: Vec<i64> = frame_vec[1..1 + n_q]
+                        .iter()
+                        .map(|&t| t.clamp(0, card - 1))
+                        .collect();
 
                     let audio_frame = Tensor::from_slice(
                         &audio_frame_wrapped,
@@ -1731,6 +1730,9 @@ impl Model {
         let max_gen_length = query.max_seq_len.unwrap_or(30000);
         let mut sent_timestamps = 0usize;
 
+        // Create StreamMask once outside the loop (batch size 1, all active)
+        let mask = moshi::StreamMask::new(vec![true], &self.device)?;
+
         for offset in 0..max_gen_length {
             // Check if client disconnected
             if tx.is_closed() {
@@ -1748,20 +1750,20 @@ impl Model {
             }
 
             // Run one step of generation
-            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref())?;
+            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref(), &mask)?;
 
-            if let Some(frame) = frame {
+            if let Some(ref frame_vec) = frame {
                 // Decode audio if past delay
                 let real_offset = offset as i64 - gen_state.max_delay as i64;
                 if real_offset >= self.config.delay_steps as i64 {
                     let n_q = self.config.n_q;
-                    let audio_frame = frame.i((0..1, 1..(1 + n_q), 0..1))?;
 
+                    // frame_vec is [text, audio0, audio1, ...] — take audio codebooks 0..n_q
                     let card = self.token_ids.card as i64;
-                    let audio_frame_vec: Vec<i64> = audio_frame.flatten_all()?.to_vec1()?;
-                    let audio_frame_wrapped: Vec<i64> = audio_frame_vec.iter().map(|&t| {
-                        t.clamp(0, card - 1)
-                    }).collect();
+                    let audio_frame_wrapped: Vec<i64> = frame_vec[1..1 + n_q]
+                        .iter()
+                        .map(|&t| t.clamp(0, card - 1))
+                        .collect();
 
                     let audio_frame = Tensor::from_slice(
                         &audio_frame_wrapped,
@@ -1806,17 +1808,19 @@ impl Model {
     }
 
     /// Run one step of generation (internal method with borrowed lm_model)
+    ///
+    /// Returns delay-corrected output as Vec<i64> with shape [1 + dep_q] (text + audio tokens),
+    /// or None if still in the initial delay period.
     fn step_inner(
         &self,
         lm_model: &mut moshi::lm::LmModel,
         state: &mut GenState,
         input_tokens: &Tensor,
         offset: usize,
-        ca_src: Option<&Tensor>,  // Cross-attention source for voice conditioning
-    ) -> Result<Option<Tensor>> {
-        use moshi::StreamMask;
-
-        let ct = state.cache.dim(2)?;
+        ca_src: Option<&Tensor>,
+        mask: &moshi::StreamMask,
+    ) -> Result<Option<Vec<i64>>> {
+        let ct = state.cache_size;
         let num_codebooks = self.config.delays.len();
         let dep_q = self.config.dep_q;
 
@@ -1841,14 +1845,7 @@ impl Model {
         for (i, &delay) in delays.iter().enumerate() {
             let write_pos = (offset + delay) % ct;
             let token = input_tokens.i((0, i, 0))?.to_scalar::<i64>()?;
-            // Update cache at position
-            let mut cache_vec: Vec<i64> = state.cache.i((0, dep_q + 1 + i, ..))?.to_vec1()?;
-            cache_vec[write_pos] = token;
-            let new_row = Tensor::from_slice(&cache_vec, ct, &self.device)?;
-            state.cache = state.cache.slice_assign(
-                &[0..1, (dep_q + 1 + i)..(dep_q + 2 + i), 0..ct],
-                &new_row.unsqueeze(0)?.unsqueeze(0)?,
-            )?;
+            state.cache[dep_q + 1 + i][write_pos] = token;
         }
 
         // Get input from cache at current position
@@ -1870,7 +1867,7 @@ impl Model {
         // Python's ScaledEmbedding with zero_idx=-1 zeros output for -1 tokens
         // We achieve the same by passing None for those audio codebooks
         let mut text_token: i64 = 0;
-        let mut audio_tokens: Vec<Option<i64>> = Vec::with_capacity(num_codebooks - 1);
+        let mut audio_tokens_input: Vec<Option<i64>> = Vec::with_capacity(num_codebooks - 1);
 
         for cb in 0..num_codebooks {
             let delay = self.config.delays[cb];
@@ -1880,10 +1877,10 @@ impl Model {
                     text_token = text_initial_token;
                 } else {
                     // Python's state.initial for audio = initial_token_id = card = 2048
-                    audio_tokens.push(Some(audio_initial_token));
+                    audio_tokens_input.push(Some(audio_initial_token));
                 }
             } else {
-                let token = state.cache.i((0, cb, read_pos))?.to_scalar::<i64>()?;
+                let token = state.cache[cb][read_pos];
                 if cb == 0 {
                     // For text tokens read from cache, match Python's ScaledEmbedding behavior:
                     // - Python clamps negative tokens to 0 before embedding lookup
@@ -1897,13 +1894,13 @@ impl Model {
                     // We achieve this by passing None to the LM forward
                     // Python's ScaledEmbedding zeros output for zero_idx=-1
                     if token == -1 {
-                        audio_tokens.push(None);  // Zero embedding contribution
+                        audio_tokens_input.push(None);  // Zero embedding contribution
                     } else if token == -2 {
                         // Ungenerated - Python clamps -2 to 0 in ScaledEmbedding
                         // This means we use embedding[0], not embedding[card]
-                        audio_tokens.push(Some(0i64));
+                        audio_tokens_input.push(Some(0i64));
                     } else {
-                        audio_tokens.push(Some(token));
+                        audio_tokens_input.push(Some(token));
                     }
                 }
             }
@@ -1915,7 +1912,7 @@ impl Model {
         // Create audio_ids Vec<Option<Tensor>> - None means zero embedding contribution
         let mut audio_ids = Vec::new();
         for cb in 0..lm_model.in_audio_codebooks() {
-            if let Some(token) = audio_tokens.get(cb).copied().flatten() {
+            if let Some(token) = audio_tokens_input.get(cb).copied().flatten() {
                 let audio_id = Tensor::from_slice(&[token as u32], (1, 1), &self.device)?;
                 audio_ids.push(Some(audio_id));
             } else {
@@ -1941,9 +1938,6 @@ impl Model {
         // Pass the combined embedding via conditioner, with text_ids=None to skip LM's text embedding
         let condition = moshi::conditioner::Condition::AddToInput(combined_emb);
 
-        // Run main transformer (batch size 1, all active)
-        let mask = StreamMask::new(vec![true], &self.device)?;
-
         // Use forward_ca if we have cross-attention source (voice conditioning)
         // Otherwise use forward_cond (no voice conditioning)
         let (text_logits, transformer_out) = if let Some(ca_tensor) = ca_src {
@@ -1955,7 +1949,7 @@ impl Model {
                 audio_ids,
                 &ca_src,
                 Some(&condition),
-                &mask,
+                mask,
             )?
         } else {
             // No cross-attention (no voice conditioning)
@@ -1963,7 +1957,7 @@ impl Model {
                 None,  // Don't use LM's text_emb, we're providing via condition
                 audio_ids,
                 Some(&condition),
-                &mask,
+                mask,
             )?
         };
 
@@ -2015,88 +2009,43 @@ impl Model {
         // Apply per-codebook masking (matches Python's _on_audio_hook)
         // Python: mask = offsets < delays[1:dep_q+1] + delay_steps
         // Where delays[cb] is the delay for audio codebook cb (cb starts at 1 for first audio)
-        let zero_token = self.token_ids.zero as u32;
+        let zero_token_u32 = self.token_ids.zero as u32;
+        let zero_token_i64 = self.token_ids.zero as i64;
         for cb in 0..dep_q {
             // Audio codebook cb corresponds to delays index cb+1 (since delays[0] is text)
             let delay = self.config.delays.get(cb + 1).copied().unwrap_or(0);
             if offset < delay + self.config.delay_steps {
-                audio_tokens[cb] = zero_token;
+                audio_tokens[cb] = zero_token_u32;
             }
         }
 
-        // Build output frame [1, 1 + dep_q, 1]
-        // NOTE: audio_tokens is Vec<u32>, but zero_token (-1) was cast from i32 to u32 (4294967295).
-        // When building the frame, we need to convert back to proper signed i64 representation.
-        // For zero tokens (4294967295u32 from -1i32), we need -1i64.
-        // For valid tokens (0..card), they stay the same.
-        let zero_token_u32 = self.token_ids.zero as u32; // -1i32 as u32 = 4294967295
-        let zero_token_i64 = self.token_ids.zero as i64; // -1i32 as i64 = -1 (sign-extended)
-        let ungenerated_token_id: i64 = -2;  // Python's lm_model.ungenerated_token_id
-
-        // Python (lm.py:775-776): mask = (offsets <= max_delay); out[mask, :, :] = ungenerated_token_id
-        // Python's offsets is post-increment (offsets + 1 after line 753), so:
-        // - mask = (offset + 1) <= max_delay = offset < max_delay
-        // During the delay period, the ENTIRE output frame is set to -2 (ungenerated)
-        let frame_vec = if offset < state.max_delay {
-            // All outputs masked to ungenerated during delay period
-            vec![ungenerated_token_id; 1 + dep_q]
-        } else {
-            let mut fv = vec![out_text as i64];
-            fv.extend(audio_tokens.iter().map(|&t| {
-                if t == zero_token_u32 {
-                    zero_token_i64 // Properly sign-extended -1
-                } else {
-                    t as i64 // Normal token, zero-extend is fine
-                }
-            }));
-            fv
-        };
-        let _frame = Tensor::from_slice(&frame_vec, (1, 1 + dep_q, 1), &self.device)?;
-
-        // Write outputs to cache
+        // Write outputs to cache directly (CPU Vec — no GPU roundtrip)
         // NOTE: Python increments state.offsets BEFORE writing, so writes happen at (offset+1) % ct.
         // See lm.py line 753: state.offsets += 1, then line 756: positions = (state.offsets % CT)
         let write_pos = (offset + 1) % ct;
 
-        // Use Vec-based cache modification to avoid slice_assign issues on GPU
-        // Read entire cache into Vec, modify, then rebuild tensor
-        let mut full_cache: Vec<Vec<i64>> = Vec::with_capacity(num_codebooks);
-        for cb in 0..num_codebooks {
-            let row: Vec<i64> = state.cache.i((0, cb, ..))?.to_vec1()?;
-            full_cache.push(row);
-        }
-
         // Text token
-        full_cache[0][write_pos] = out_text as i64;
+        state.cache[0][write_pos] = out_text as i64;
 
         // Audio tokens
-        // Note: token_ids.zero is -1, but audio_tokens are u32 so -1 becomes 4294967295
-        // We need to convert back to signed for proper cache handling
-        let zero_token_u32 = self.token_ids.zero as u32; // -1 as u32 = 4294967295
-        let zero_token_i64 = self.token_ids.zero as i64; // -1
         let delay_steps = self.config.delay_steps;
         for (i, &token) in audio_tokens.iter().enumerate() {
             if i + 1 < num_codebooks {
                 // Python's on_audio_hook forces early audio tokens to zero (-1)
-                // This matches: if offset < delay + self.delay_steps: audio_tokens[:, q] = self.machine.token_ids.zero
                 let audio_cb_delay = self.config.delays.get(i + 1).copied().unwrap_or(0);
                 let force_zero = offset < audio_cb_delay + delay_steps;
 
                 // Convert back to signed representation for special tokens
                 let token_i64 = if force_zero {
-                    zero_token_i64 // Force early audio tokens to zero (-1)
+                    zero_token_i64
                 } else if token == zero_token_u32 {
-                    zero_token_i64 // Store as -1
+                    zero_token_i64
                 } else {
                     token as i64
                 };
-                full_cache[i + 1][write_pos] = token_i64;
+                state.cache[i + 1][write_pos] = token_i64;
             }
         }
-
-        // Rebuild cache tensor from Vec
-        let flat_cache: Vec<i64> = full_cache.iter().flatten().copied().collect();
-        state.cache = Tensor::from_slice(&flat_cache, (1, num_codebooks, ct), &self.device)?;
 
         // Return delay-corrected frame
         // NOTE: Python's _step() increments offset BEFORE checking the delay mask,
@@ -2108,18 +2057,18 @@ impl Model {
             return Ok(None);
         }
 
-        // Gather delay-corrected output
+        // Gather delay-corrected output directly from CPU cache
         // NOTE: Python uses (state.offsets - max_delay + delay) where state.offsets is POST-increment
         // (already incremented by +1 at start of step). So we use (offset+1) here.
-        let mut out_vec = Vec::new();
+        let mut out_vec = Vec::with_capacity(dep_q + 1);
         for cb in 0..(dep_q + 1) {
             let delay = self.config.delays[cb];
             let read_pos = ((offset + 1) as isize - max_delay as isize + delay as isize).rem_euclid(ct as isize) as usize;
-            let token = state.cache.i((0, cb, read_pos))?.to_scalar::<i64>()?;
+            let token = state.cache[cb][read_pos];
             out_vec.push(token);
         }
 
-        Ok(Some(Tensor::from_slice(&out_vec, (1, dep_q + 1, 1), &self.device)?))
+        Ok(Some(out_vec))
     }
 
     /// Handle a WebSocket connection for streaming TTS.
