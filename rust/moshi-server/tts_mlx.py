@@ -121,51 +121,46 @@ def init(batch_size: int, config_override: dict) -> 'TTSService':
         cfg_coef_conditioning = tts_model.cfg_coef
         tts_model.cfg_coef = 1.0
 
-    # Load voices - only look for .safetensors files directly
-    print(f"[MLX] Loading voices from {config.voice_folder}", file=sys.stderr, flush=True)
+    # Scan for voice files (lazy loading - don't load all at startup)
+    print(f"[MLX] Scanning for voices in {config.voice_folder}", file=sys.stderr, flush=True)
     voice_suffix = tts_model.voice_suffix
-    all_attributes = {}
+    voice_files = {}  # Maps voice name -> file path (not loaded yet)
     voice_folder = Path(config.voice_folder)
 
     if tts_model.multi_speaker:
-        # Only look for files that end with the voice suffix (e.g., .1e68beda@240.safetensors)
+        # Just scan for files, don't load them yet
         for file in voice_folder.glob(f'**/*{voice_suffix}'):
             relative = file.relative_to(voice_folder)
             name = str(relative.with_name(relative.name.removesuffix(voice_suffix)))
             name_normalized = name.replace('\\', '/')
-            try:
-                attributes = tts_model.make_condition_attributes([file, file], cfg_coef=cfg_coef_conditioning)
-                all_attributes[name] = attributes
-                if name != name_normalized:
-                    all_attributes[name_normalized] = attributes
-            except Exception as e:
-                # Only warn for files that should work (actual safetensors files)
-                print(f"[MLX WARNING] Failed to load voice {name_normalized}: {e}", file=sys.stderr)
+            voice_files[name] = file
+            if name != name_normalized:
+                voice_files[name_normalized] = file
 
-        if not all_attributes:
+        if not voice_files:
             raise RuntimeError(
                 f"No voices found in {voice_folder}/**/*{voice_suffix}"
             )
 
-        print(f"[MLX] Loaded {len(all_attributes)} voices", file=sys.stderr, flush=True)
+        print(f"[MLX] Found {len(voice_files)} voice files (lazy loading enabled)", file=sys.stderr, flush=True)
 
-        if config.default_voice not in all_attributes:
-            # Try adding .wav suffix
+        # Validate default voice exists
+        if config.default_voice not in voice_files:
             default_with_wav = config.default_voice + ".wav" if not config.default_voice.endswith(".wav") else config.default_voice
             default_without_wav = config.default_voice.removesuffix(".wav")
-            if default_with_wav in all_attributes:
+            if default_with_wav in voice_files:
                 config.default_voice = default_with_wav
-            elif default_without_wav in all_attributes:
+            elif default_without_wav in voice_files:
                 config.default_voice = default_without_wav
             else:
                 print(f"[MLX WARNING] Default voice {config.default_voice} not found, using first available", file=sys.stderr)
-                config.default_voice = list(all_attributes.keys())[0]
-        print(f"[MLX] Using default voice: {config.default_voice}", file=sys.stderr, flush=True)
+                config.default_voice = list(voice_files.keys())[0]
+        print(f"[MLX] Default voice: {config.default_voice}", file=sys.stderr, flush=True)
 
     service = TTSService(
         batch_size=batch_size,
         default_attribute_name=config.default_voice,
-        all_attributes=all_attributes,
+        voice_files=voice_files,
         tts_model=tts_model,
         cfg_coef_conditioning=cfg_coef_conditioning,
         padding_between=config.padding_between,
@@ -197,12 +192,13 @@ class ClientState:
 class TTSService:
     batch_size: int
     default_attribute_name: str
-    all_attributes: dict[str, tp.Sequence[ConditionAttributes]]
+    voice_files: dict[str, Path]  # Maps voice name -> file path
     tts_model: TTSModel
     cfg_coef_conditioning: float | None = None
     padding_between: int = 1
 
     clients: list[ClientState] = field(default_factory=list)
+    _loaded_attributes: dict[str, ConditionAttributes] = field(default_factory=dict)  # Cache for loaded voices
 
     def __post_init__(self):
         for _ in range(self.batch_size):
@@ -214,21 +210,63 @@ class TTSService:
         mx.eval(self.tts_model.lm.parameters())
         print(f"[MLX] second_stream_ahead={self.tts_model.machine.second_stream_ahead}", file=sys.stderr, flush=True)
         print(f"[MLX] delay_steps={self.tts_model.delay_steps}", file=sys.stderr, flush=True)
+
+        # Pre-load the default voice to ensure fast first request
+        print(f"[MLX] Pre-loading default voice: {self.default_attribute_name}", file=sys.stderr, flush=True)
+        self._load_voice(self.default_attribute_name)
+
         print("[MLX] Warmup complete", file=sys.stderr, flush=True)
+
+    def _load_voice(self, voice_name: str) -> ConditionAttributes | None:
+        """Load a voice file and cache the attributes. Returns None if not found."""
+        if voice_name in self._loaded_attributes:
+            return self._loaded_attributes[voice_name]
+
+        # Find the file path
+        file_path = None
+        if voice_name in self.voice_files:
+            file_path = self.voice_files[voice_name]
+        else:
+            # Try with/without .wav suffix
+            voice_with_wav = voice_name if voice_name.endswith(".wav") else voice_name + ".wav"
+            voice_without_wav = voice_name.removesuffix(".wav")
+            if voice_with_wav in self.voice_files:
+                file_path = self.voice_files[voice_with_wav]
+            elif voice_without_wav in self.voice_files:
+                file_path = self.voice_files[voice_without_wav]
+
+        if file_path is None:
+            return None
+
+        try:
+            attributes = self.tts_model.make_condition_attributes(
+                [file_path, file_path], cfg_coef=self.cfg_coef_conditioning
+            )
+            # Force evaluation to prevent lazy loading issues
+            for key, tensor_cond in attributes.tensor.items():
+                mx.eval(tensor_cond.tensor)
+                if tensor_cond.mask is not None:
+                    mx.eval(tensor_cond.mask)
+            self._loaded_attributes[voice_name] = attributes
+            print(f"[MLX] Loaded voice: {voice_name}", file=sys.stderr, flush=True)
+            return attributes
+        except Exception as e:
+            print(f"[MLX ERROR] Failed to load voice {voice_name}: {e}", file=sys.stderr)
+            return None
 
     def _get_attributes(self, voice: str | None) -> tp.Sequence[ConditionAttributes]:
         if voice:
-            # Try exact match
-            if voice in self.all_attributes:
-                return self.all_attributes[voice]
-            # Try with/without .wav suffix
-            voice_with_wav = voice if voice.endswith(".wav") else voice + ".wav"
-            voice_without_wav = voice.removesuffix(".wav")
-            if voice_with_wav in self.all_attributes:
-                return self.all_attributes[voice_with_wav]
-            if voice_without_wav in self.all_attributes:
-                return self.all_attributes[voice_without_wav]
-        return self.all_attributes[self.default_attribute_name]
+            # Try to load the requested voice
+            attrs = self._load_voice(voice)
+            if attrs is not None:
+                return attrs
+
+        # Fall back to default voice
+        attrs = self._load_voice(self.default_attribute_name)
+        if attrs is not None:
+            return attrs
+
+        raise RuntimeError(f"Failed to load default voice: {self.default_attribute_name}")
 
     def _reset_client(self, client: ClientState, voice: str | None, seed: int | None):
         """Reset a client for new generation."""
