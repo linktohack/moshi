@@ -803,8 +803,7 @@ fn tts_router(s: Arc<tts::Model>, path: &str, ss: &SharedState) -> axum::Router<
     }
 
     axum::Router::new()
-        .route(path, axum::routing::post(t))
-        .route(&format!("{path}_streaming"), axum::routing::get(streaming_t))
+        .route(path, axum::routing::post(t).get(streaming_t))
         .with_state((s, ss.clone()))
 }
 
