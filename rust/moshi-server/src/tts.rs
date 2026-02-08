@@ -913,6 +913,40 @@ impl Default for TtsModelConfig {
     }
 }
 
+/// Accumulated timing breakdown for step_inner profiling
+#[derive(Default)]
+struct StepTimings {
+    cache_and_prep: std::time::Duration,
+    embedding: std::time::Duration,
+    transformer: std::time::Duration,
+    text_sampling: std::time::Duration,
+    depformer: std::time::Duration,
+    cache_write_and_output: std::time::Duration,
+    steps: usize,
+}
+
+impl StepTimings {
+    fn log_summary(&self) {
+        if self.steps == 0 { return; }
+        let total = self.cache_and_prep + self.embedding + self.transformer
+            + self.text_sampling + self.depformer + self.cache_write_and_output;
+        let total_ms = total.as_secs_f64() * 1000.0;
+        let n = self.steps as f64;
+        tracing::info!(
+            steps = self.steps,
+            total_ms = format!("{:.1}", total_ms),
+            cache_prep_ms = format!("{:.1} ({:.1}%)", self.cache_and_prep.as_secs_f64() * 1000.0, self.cache_and_prep.as_secs_f64() / total.as_secs_f64() * 100.0),
+            embedding_ms = format!("{:.1} ({:.1}%)", self.embedding.as_secs_f64() * 1000.0, self.embedding.as_secs_f64() / total.as_secs_f64() * 100.0),
+            transformer_ms = format!("{:.1} ({:.1}%)", self.transformer.as_secs_f64() * 1000.0, self.transformer.as_secs_f64() / total.as_secs_f64() * 100.0),
+            text_sampling_ms = format!("{:.1} ({:.1}%)", self.text_sampling.as_secs_f64() * 1000.0, self.text_sampling.as_secs_f64() / total.as_secs_f64() * 100.0),
+            depformer_ms = format!("{:.1} ({:.1}%)", self.depformer.as_secs_f64() * 1000.0, self.depformer.as_secs_f64() / total.as_secs_f64() * 100.0),
+            cache_output_ms = format!("{:.1} ({:.1}%)", self.cache_write_and_output.as_secs_f64() * 1000.0, self.cache_write_and_output.as_secs_f64() / total.as_secs_f64() * 100.0),
+            avg_step_ms = format!("{:.2}", total_ms / n),
+            "step_inner profiling summary"
+        );
+    }
+}
+
 /// Streaming generation state
 #[allow(dead_code)]
 pub struct GenState {
@@ -1586,6 +1620,7 @@ impl Model {
 
         // Create StreamMask once outside the loop (batch size 1, all active)
         let mask = moshi::StreamMask::new(vec![true], &self.device)?;
+        let mut timings = StepTimings::default();
 
         // Generation starts at offset 0, matching Python's client.offset = 0
         for offset in 0..max_gen_length {
@@ -1599,7 +1634,7 @@ impl Model {
             }
 
             // Run one step of generation
-            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref(), &mask)?;
+            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref(), &mask, &mut timings)?;
 
             if let Some(ref frame_vec) = frame {
 
@@ -1648,6 +1683,8 @@ impl Model {
 
             gen_state.offset = offset + 1;
         }
+
+        timings.log_summary();
 
         // Encode final audio
         let mut buffer = Vec::new();
@@ -1732,6 +1769,7 @@ impl Model {
 
         // Create StreamMask once outside the loop (batch size 1, all active)
         let mask = moshi::StreamMask::new(vec![true], &self.device)?;
+        let mut timings = StepTimings::default();
 
         for offset in 0..max_gen_length {
             // Check if client disconnected
@@ -1750,7 +1788,7 @@ impl Model {
             }
 
             // Run one step of generation
-            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref(), &mask)?;
+            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref(), &mask, &mut timings)?;
 
             if let Some(ref frame_vec) = frame {
                 // Decode audio if past delay
@@ -1804,6 +1842,8 @@ impl Model {
             gen_state.offset = offset + 1;
         }
 
+        timings.log_summary();
+
         Ok(())
     }
 
@@ -1819,6 +1859,7 @@ impl Model {
         offset: usize,
         ca_src: Option<&Tensor>,
         mask: &moshi::StreamMask,
+        timings: &mut StepTimings,
     ) -> Result<Option<Vec<i64>>> {
         let ct = state.cache_size;
         let num_codebooks = self.config.delays.len();
@@ -1834,6 +1875,8 @@ impl Model {
                 "step_inner first step debug"
             );
         }
+
+        let t0 = std::time::Instant::now();
 
         // Write input tokens to cache with delays (only for codebooks beyond dep_q)
         let extra_cb_start = dep_q + 1;
@@ -1916,9 +1959,12 @@ impl Model {
                 let audio_id = Tensor::from_slice(&[token as u32], (1, 1), &self.device)?;
                 audio_ids.push(Some(audio_id));
             } else {
-                audio_ids.push(None);  // Zero embedding contribution
+                audio_ids.push(None);
             }
         }
+
+        timings.cache_and_prep += t0.elapsed();
+        let t1 = std::time::Instant::now();
 
         // Compute text embedding using our multiplexed embedding (handles demuxing)
         // This replaces the LM's standard text_emb when second_stream_ahead > 0
@@ -1938,6 +1984,10 @@ impl Model {
         // Pass the combined embedding via conditioner, with text_ids=None to skip LM's text embedding
         let condition = moshi::conditioner::Condition::AddToInput(combined_emb);
 
+        timings.embedding += t1.elapsed();
+        let t2 = std::time::Instant::now();
+
+        // Run main transformer (batch size 1, all active)
         // Use forward_ca if we have cross-attention source (voice conditioning)
         // Otherwise use forward_cond (no voice conditioning)
         let (text_logits, transformer_out) = if let Some(ca_tensor) = ca_src {
@@ -1952,7 +2002,6 @@ impl Model {
                 mask,
             )?
         } else {
-            // No cross-attention (no voice conditioning)
             lm_model.forward_cond(
                 None,  // Don't use LM's text_emb, we're providing via condition
                 audio_ids,
@@ -1960,6 +2009,9 @@ impl Model {
                 mask,
             )?
         };
+
+        timings.transformer += t2.elapsed();
+        let t3 = std::time::Instant::now();
 
         // Sample text token - text_logits shape is [B, T, vocab] = [1, 1, vocab]
         let text_logits_1d = text_logits.i((0, 0, ..))?.to_dtype(DType::F32)?;
@@ -1979,6 +2031,9 @@ impl Model {
 
         // Process through state machine
         let (out_text, _consumed) = self.machine.process(offset, &mut state.machine_state, sampled_text);
+
+        timings.text_sampling += t3.elapsed();
+        let t4 = std::time::Instant::now();
 
         // Sample audio tokens via TTS depformer
         let mut audio_tokens;
@@ -2005,6 +2060,9 @@ impl Model {
             // Before delay_steps, use zero tokens
             audio_tokens = vec![self.token_ids.zero as u32; dep_q];
         }
+
+        timings.depformer += t4.elapsed();
+        let t5 = std::time::Instant::now();
 
         // Apply per-codebook masking (matches Python's _on_audio_hook)
         // Python: mask = offsets < delays[1:dep_q+1] + delay_steps
@@ -2067,6 +2125,9 @@ impl Model {
             let token = state.cache[cb][read_pos];
             out_vec.push(token);
         }
+
+        timings.cache_write_and_output += t5.elapsed();
+        timings.steps += 1;
 
         Ok(Some(out_vec))
     }
