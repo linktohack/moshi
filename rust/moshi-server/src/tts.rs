@@ -638,6 +638,12 @@ pub enum OutMsg {
     Ready,
 }
 
+/// Events emitted during streaming TTS generation
+pub(crate) enum StreamEvent {
+    Pcm(Vec<f32>),
+    Word(WordWithTimestamps),
+}
+
 /// Audio encoder supporting multiple output formats
 pub enum Encoder {
     OggOpus(kaudio::ogg_opus::Encoder),
@@ -1651,6 +1657,154 @@ impl Model {
         Ok((buffer, timestamps))
     }
 
+    /// Run TTS generation with streaming output.
+    /// Sends each decoded PCM frame and word timestamp via the channel as they're produced.
+    pub fn run_streaming(
+        &self,
+        query: &crate::TtsQuery,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<()> {
+        // Tokenize text
+        let entries = self.tokenize_text(&query.text)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(num_entries = entries.len(), "Tokenized text into entries (streaming)");
+
+        // Get voice embedding
+        let voice = self.get_voice(query.voice.as_deref());
+        if voice.is_none() && !self.voices.is_empty() {
+            tracing::warn!(
+                voice = ?query.voice,
+                default = %self.default_voice,
+                "Voice not found, using default"
+            );
+        }
+
+        let num_codebooks = self.config.delays.len();
+        let mut gen_state = GenState::new(
+            num_codebooks,
+            &self.config.delays,
+            entries,
+            &self.machine,
+            &self.device,
+            query.temperature,
+            self.config.temp_text,
+            query.top_k,
+            self.config.top_k_text,
+            query.seed,
+        )?;
+
+        // Lock models for generation
+        let mut lm_model = self.lm_model.lock().map_err(|e| anyhow::anyhow!("lm_model lock poisoned: {}", e))?;
+        let mut mimi = self.mimi.lock().map_err(|e| anyhow::anyhow!("mimi lock poisoned: {}", e))?;
+
+        // Reset model states
+        lm_model.reset_state();
+        mimi.reset_state();
+
+        // Calculate "missing" codebooks
+        let zero_token = self.token_ids.zero;
+        let num_codebooks = self.config.delays.len();
+        let num_audio_codebooks = num_codebooks.saturating_sub(1);
+        let missing = num_audio_codebooks.saturating_sub(self.config.dep_q);
+        let input_tokens = if missing > 0 {
+            Tensor::full(
+                zero_token as i64,
+                (1, missing, 1),
+                &self.device,
+            )?.to_dtype(DType::I64)?
+        } else {
+            Tensor::zeros((1, 0, 1), DType::I64, &self.device)?
+        };
+
+        // Get cross-attention source for voice conditioning
+        let voice_name = query.voice.as_deref().unwrap_or(&self.default_voice);
+        let ca_src = self.cross_attention_cache.get(voice_name).cloned();
+        if ca_src.is_some() {
+            tracing::info!(voice = %voice_name, "Using cross-attention for voice conditioning (streaming)");
+        } else if !self.cross_attention_cache.is_empty() {
+            tracing::warn!(voice = %voice_name, "Voice not in cross-attention cache, using without voice conditioning");
+        }
+
+        let max_gen_length = query.max_seq_len.unwrap_or(30000);
+        let mut sent_timestamps = 0usize;
+
+        for offset in 0..max_gen_length {
+            // Check if client disconnected
+            if tx.is_closed() {
+                tracing::info!(offset, "Client disconnected, stopping generation");
+                break;
+            }
+
+            // Check if we're done
+            if let Some(end_step) = gen_state.machine_state.end_step {
+                let real_end = end_step + self.config.delay_steps + self.config.final_padding + gen_state.max_delay;
+                if offset >= real_end {
+                    tracing::debug!(offset, end_step, real_end, "Generation complete (streaming)");
+                    break;
+                }
+            }
+
+            // Run one step of generation
+            let frame = self.step_inner(&mut lm_model, &mut gen_state, &input_tokens, offset, ca_src.as_ref())?;
+
+            if let Some(frame) = frame {
+                // Decode audio if past delay
+                let real_offset = offset as i64 - gen_state.max_delay as i64;
+                if real_offset >= self.config.delay_steps as i64 {
+                    let n_q = self.config.n_q;
+                    let audio_frame = frame.i((0..1, 1..(1 + n_q), 0..1))?;
+
+                    let card = self.token_ids.card as i64;
+                    let audio_frame_vec: Vec<i64> = audio_frame.flatten_all()?.to_vec1()?;
+                    let audio_frame_wrapped: Vec<i64> = audio_frame_vec.iter().map(|&t| {
+                        t.clamp(0, card - 1)
+                    }).collect();
+
+                    let audio_frame = Tensor::from_slice(
+                        &audio_frame_wrapped,
+                        (1, n_q, 1),
+                        &self.device
+                    )?;
+                    let audio_frame = audio_frame.to_dtype(DType::U32)?;
+
+                    let pcm = mimi.decode_step(&audio_frame.into(), &().into())?;
+                    if let Some(pcm) = pcm.as_option() {
+                        let pcm: Vec<f32> = pcm.i((0, 0))?.to_vec1()?;
+                        if tx.send(StreamEvent::Pcm(pcm)).is_err() {
+                            tracing::info!(offset, "Client disconnected during PCM send");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Send new transcript timestamps
+            let transcript_len = gen_state.machine_state.transcript.len();
+            if transcript_len > sent_timestamps {
+                for (word, step) in &gen_state.machine_state.transcript[sent_timestamps..] {
+                    let start_s = *step as f64 / self.config.frame_rate;
+                    let stop_s = start_s + 0.1;
+                    if tx.send(StreamEvent::Word(WordWithTimestamps {
+                        text: word.clone(),
+                        start_s,
+                        stop_s,
+                    })).is_err() {
+                        tracing::info!(offset, "Client disconnected during word send");
+                        break;
+                    }
+                }
+                sent_timestamps = transcript_len;
+            }
+
+            gen_state.offset = offset + 1;
+        }
+
+        Ok(())
+    }
+
     /// Run one step of generation (internal method with borrowed lm_model)
     fn step_inner(
         &self,
@@ -1968,9 +2122,11 @@ impl Model {
         Ok(Some(Tensor::from_slice(&out_vec, (1, dep_q + 1, 1), &self.device)?))
     }
 
-    /// Handle a WebSocket connection for streaming TTS
+    /// Handle a WebSocket connection for streaming TTS.
+    /// Uses `self: Arc<Self>` so we can move into spawn_blocking while keeping
+    /// the async WebSocket sender in the main task.
     pub async fn handle_socket(
-        &self,
+        self: std::sync::Arc<Self>,
         mut socket: ws::WebSocket,
         query: crate::TtsStreamingQuery,
     ) -> Result<()> {
@@ -2015,7 +2171,13 @@ impl Model {
 
         tracing::info!(text = %full_text, "Received text for TTS");
 
-        // Create TTS query and run synchronously
+        // Create encoder and send header before generation starts
+        let mut encoder = Encoder::new(query.format.clone())?;
+        if let Some(header) = encoder.header()? {
+            socket.send(ws::Message::Binary(header.into())).await?;
+        }
+
+        // Create TTS query
         let tts_query = crate::TtsQuery {
             text: vec![full_text],
             seed: query.seed,
@@ -2028,45 +2190,41 @@ impl Model {
             cfg_alpha: query.cfg_alpha,
         };
 
-        // Run generation (blocking)
-        let (wav_data, timestamps) = self.run(&tts_query)?;
+        // Channel for streaming events from blocking generation to async WS sender
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
 
-        // Decode WAV to get raw PCM
-        let pcm = self.decode_wav_to_pcm(&wav_data)?;
+        // Spawn blocking generation on a thread pool thread
+        let model = std::sync::Arc::clone(&self);
+        let gen_handle = tokio::task::spawn_blocking(move || {
+            model.run_streaming(&tts_query, event_tx)
+        });
 
-        // Create encoder for output format
-        let mut encoder = Encoder::new(query.format.clone())?;
-
-        // Send header if any (for OggOpus)
-        if let Some(header) = encoder.header()? {
-            socket.send(ws::Message::Binary(header.into())).await?;
-        }
-
-        // Send timestamps
-        for wwts in timestamps {
-            if let Some(word_msg) = encoder.encode_word(wwts)? {
-                socket.send(ws::Message::Binary(word_msg.into())).await?;
+        // Async loop: receive events and forward to WebSocket
+        let mut total_samples = 0usize;
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                StreamEvent::Pcm(pcm) => {
+                    total_samples += pcm.len();
+                    let encoded = encoder.encode(pcm)?;
+                    socket.send(ws::Message::Binary(encoded.into())).await?;
+                }
+                StreamEvent::Word(wwts) => {
+                    if let Some(word_msg) = encoder.encode_word(wwts)? {
+                        socket.send(ws::Message::Binary(word_msg.into())).await?;
+                    }
+                }
             }
         }
 
-        // Send audio in chunks
-        const PCM_CHUNK_SIZE: usize = 2400; // 100ms at 24kHz
-        let total_chunks = pcm.len().div_ceil(PCM_CHUNK_SIZE);
-        for (i, chunk) in pcm.chunks(PCM_CHUNK_SIZE).enumerate() {
-            let encoded = encoder.encode(chunk.to_vec())?;
-            socket.send(ws::Message::Binary(encoded.into())).await?;
-            if i % 20 == 0 {
-                tracing::debug!(chunk = i, total = total_chunks, "Sending audio chunk");
-            }
-        }
+        // Wait for generation thread to finish and propagate any errors
+        gen_handle.await??;
 
-        tracing::info!(total_samples = pcm.len(), total_chunks, "Streaming TTS completed, sending close frame");
+        tracing::info!(total_samples, "Streaming TTS completed, sending close frame");
 
         // Send close frame to properly terminate the WebSocket connection
         socket.send(ws::Message::Close(None)).await?;
 
         // Wait for client's close response to ensure all data is flushed
-        // The WebSocket protocol requires both sides to acknowledge the close
         while let Some(msg) = socket.next().await {
             match msg {
                 Ok(ws::Message::Close(_)) => {
@@ -2077,65 +2235,11 @@ impl Model {
                     tracing::debug!(err = ?e, "Connection closed while waiting for close ack");
                     break;
                 }
-                _ => {
-                    // Ignore other messages while closing
-                    continue;
-                }
+                _ => continue,
             }
         }
 
         Ok(())
-    }
-
-    /// Decode WAV data to raw PCM f32 samples
-    /// Assumes 16-bit PCM WAV format (as produced by kaudio::wav::write_pcm_as_wav)
-    fn decode_wav_to_pcm(&self, wav_data: &[u8]) -> Result<Vec<f32>> {
-        // Simple WAV parser - skip 44-byte header and read 16-bit PCM samples
-        if wav_data.len() < 44 {
-            anyhow::bail!("WAV data too short");
-        }
-
-        // Verify RIFF header
-        if &wav_data[0..4] != b"RIFF" || &wav_data[8..12] != b"WAVE" {
-            anyhow::bail!("Invalid WAV header");
-        }
-
-        // Find data chunk - typically at byte 44 but can vary
-        let mut pos = 12;
-        while pos + 8 < wav_data.len() {
-            let chunk_id = &wav_data[pos..pos + 4];
-            let chunk_size = u32::from_le_bytes([
-                wav_data[pos + 4],
-                wav_data[pos + 5],
-                wav_data[pos + 6],
-                wav_data[pos + 7],
-            ]) as usize;
-
-            if chunk_id == b"data" {
-                let data_start = pos + 8;
-                let data_end = (data_start + chunk_size).min(wav_data.len());
-                let pcm_data = &wav_data[data_start..data_end];
-
-                // Convert 16-bit PCM to f32
-                let samples: Vec<f32> = pcm_data
-                    .chunks_exact(2)
-                    .map(|bytes| {
-                        let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
-                        sample as f32 / 32768.0
-                    })
-                    .collect();
-
-                return Ok(samples);
-            }
-
-            pos += 8 + chunk_size;
-            // Align to even boundary
-            if chunk_size % 2 == 1 {
-                pos += 1;
-            }
-        }
-
-        anyhow::bail!("No data chunk found in WAV")
     }
 
     /// Get the device
