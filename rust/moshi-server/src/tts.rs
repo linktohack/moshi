@@ -1537,6 +1537,8 @@ impl Model {
 
         // Reset LM model state
         lm_model.reset_state();
+        // Reset Mimi decoder state so decode_step maintains continuity across frames
+        mimi.reset_state();
 
         // Calculate "missing" codebooks - audio streams beyond what depformer handles
         // num_codebooks = 33 (text + 32 audio), dep_q = 32 (depformer outputs)
@@ -1618,9 +1620,11 @@ impl Model {
                     // Convert to u32 for mimi decode
                     let audio_frame = audio_frame.to_dtype(DType::U32)?;
 
-                    let pcm = mimi.decode(&audio_frame)?;
-                    let pcm: Vec<f32> = pcm.i((0, 0, ..))?.to_vec1()?;
-                    all_pcm.extend(pcm);
+                    let pcm = mimi.decode_step(&audio_frame.into(), &().into())?;
+                    if let Some(pcm) = pcm.as_option() {
+                        let pcm: Vec<f32> = pcm.i((0, 0))?.to_vec1()?;
+                        all_pcm.extend(pcm);
+                    }
                 }
             }
 
